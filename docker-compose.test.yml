@@ -1,0 +1,18 @@
+services:
+  sshserver:
+    build: tests/testserver
+    ports:
+      - "2222:22"
+
+  wsproxy:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      ALLOWED_ORIGINS: "*"
+      # Auth disabled for testing (no CLERK_JWKS_URL)
+      # Allow connections to sshserver container
+      BLOCKED_TARGETS: "169.254.0.0/16"
+    depends_on:
+      - sshserver
