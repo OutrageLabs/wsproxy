@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/http/httptest"
 	"testing"
 )
@@ -60,15 +61,26 @@ func TestBase64URLDecode(t *testing.T) {
 }
 
 func TestExtractIP(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("1.2.3.0/24")
+	trustedCfg := &Config{TrustedProxies: []*net.IPNet{trusted}}
+
 	tests := []struct {
 		remoteAddr string
 		xff        string
 		xRealIP    string
+		cfg        *Config
 		expected   string
 	}{
-		{"1.2.3.4:5000", "", "", "1.2.3.4"},
-		{"1.2.3.4:5000", "5.6.7.8, 9.10.11.12", "", "5.6.7.8"},
-		{"1.2.3.4:5000", "", "9.10.11.12", "9.10.11.12"},
+		// No proxy headers, no trusted config.
+		{"1.2.3.4:5000", "", "", nil, "1.2.3.4"},
+		// XFF from trusted proxy — use XFF.
+		{"1.2.3.4:5000", "5.6.7.8, 9.10.11.12", "", trustedCfg, "5.6.7.8"},
+		// X-Real-IP from trusted proxy — use it.
+		{"1.2.3.4:5000", "", "9.10.11.12", trustedCfg, "9.10.11.12"},
+		// XFF from untrusted source — ignore, use RemoteAddr.
+		{"9.9.9.9:5000", "5.6.7.8", "", trustedCfg, "9.9.9.9"},
+		// No config at all (nil) — use RemoteAddr.
+		{"1.2.3.4:5000", "5.6.7.8", "", nil, "1.2.3.4"},
 	}
 
 	for _, tt := range tests {
@@ -80,7 +92,7 @@ func TestExtractIP(t *testing.T) {
 		if tt.xRealIP != "" {
 			req.Header.Set("X-Real-IP", tt.xRealIP)
 		}
-		got := extractIP(req)
+		got := extractIP(req, tt.cfg)
 		if got != tt.expected {
 			t.Errorf("extractIP(%q, xff=%q, xri=%q): got %q, want %q",
 				tt.remoteAddr, tt.xff, tt.xRealIP, got, tt.expected)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -30,21 +31,23 @@ type TunnelReady struct {
 
 // HTTPRequest is sent proxy → browser for incoming HTTP requests on the subdomain.
 type HTTPRequest struct {
-	Type    string            `json:"type"`    // "http_request"
-	ID      string            `json:"id"`      // unique request ID for correlation
-	Method  string            `json:"method"`  // GET, POST, etc.
-	Path    string            `json:"path"`    // /api/data
-	Headers map[string]string `json:"headers"` // flattened headers
-	Body    string            `json:"body"`    // base64 for binary
+	Type         string            `json:"type"`                   // "http_request"
+	ID           string            `json:"id"`                     // unique request ID for correlation
+	Method       string            `json:"method"`                 // GET, POST, etc.
+	Path         string            `json:"path"`                   // /api/data
+	Headers      map[string]string `json:"headers"`                // flattened headers
+	Body         string            `json:"body"`                   // text or base64-encoded
+	BodyEncoding string            `json:"bodyEncoding,omitempty"` // "base64" if body is encoded
 }
 
 // HTTPResponse is sent browser → proxy as response to an HTTPRequest.
 type HTTPResponse struct {
-	Type    string            `json:"type"`    // "http_response"
-	ID      string            `json:"id"`      // matches HTTPRequest.ID
-	Status  int               `json:"status"`  // 200, 404, etc.
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`    // base64 for binary
+	Type         string            `json:"type"`                   // "http_response"
+	ID           string            `json:"id"`                     // matches HTTPRequest.ID
+	Status       int               `json:"status"`                 // 200, 404, etc.
+	Headers      map[string]string `json:"headers"`
+	Body         string            `json:"body"`                   // text or base64-encoded
+	BodyEncoding string            `json:"bodyEncoding,omitempty"` // "base64" if body is encoded
 }
 
 // TCPOpen is sent proxy → browser when a new raw TCP connection arrives.
@@ -77,12 +80,23 @@ type Tunnel struct {
 	Ctx       context.Context
 	Cancel    context.CancelFunc
 
+	// wsMu serializes all writes to the WebSocket connection.
+	// coder/websocket does NOT support concurrent writers.
+	wsMu sync.Mutex
+
 	// Pending HTTP requests waiting for responses from the browser.
 	mu       sync.Mutex
 	pending  map[string]chan *HTTPResponse
 
 	// Raw TCP connections multiplexed over this tunnel.
 	tcpConns sync.Map // connID → net.Conn
+}
+
+// writeWS is a concurrency-safe write to the tunnel WebSocket.
+func (t *Tunnel) writeWS(msgType websocket.MessageType, data []byte) error {
+	t.wsMu.Lock()
+	defer t.wsMu.Unlock()
+	return t.WS.Write(t.Ctx, msgType, data)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -123,7 +137,7 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 		}
 
 		// Rate limit.
-		clientIP := extractIP(r)
+		clientIP := extractIP(r, tm.cfg)
 		if !rl.Acquire(clientIP, userID) {
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
@@ -200,11 +214,51 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 			go tm.serveTCPPort(tunnel, rawPort)
 		}
 
-		// Read control messages from browser.
+		// Set read size limit to prevent OOM from malicious clients.
+		wsConn.SetReadLimit(10 * 1024 * 1024) // 10 MB
+
+		// Start ping loop to keep tunnel alive through NAT/proxies.
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := wsConn.Ping(ctx); err != nil {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+
+		// Read control messages and binary TCP data from browser.
 		for {
-			_, data, err := wsConn.Read(ctx)
+			msgType, data, err := wsConn.Read(ctx)
 			if err != nil {
 				return
+			}
+
+			// Binary frames carry TCP data: [4B connID len][connID][payload]
+			if msgType == websocket.MessageBinary {
+				connID, payload := parseBinaryFrame(data)
+				if connID != "" && len(payload) > 0 {
+					if conn, ok := tunnel.tcpConns.Load(connID); ok {
+						tcpConn := conn.(net.Conn)
+						tcpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+						if _, err := tcpConn.Write(payload); err != nil {
+							// Write failed — close the TCP connection and notify browser.
+							tunnel.tcpConns.Delete(connID)
+							tcpConn.Close()
+							closeMsg := TCPClose{Type: "tcp_close", ConnID: connID}
+							closeJSON, _ := json.Marshal(closeMsg)
+							tunnel.writeWS(websocket.MessageText, closeJSON)
+						}
+					}
+				}
+				continue
 			}
 
 			var msg ControlMessage
@@ -243,7 +297,7 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 
 // HandleTunnelHTTP routes incoming HTTP requests on tunnel subdomains
 // to the appropriate browser via WebSocket.
-func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request) {
+func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request, rl *RateLimiter) {
 	// Extract subdomain from Host header.
 	subdomain := tm.extractSubdomain(r.Host)
 	if subdomain == "" {
@@ -259,21 +313,38 @@ func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Rate limit tunnel HTTP traffic by client IP only.
+	// Don't attribute to tunnel owner — external DDoS traffic shouldn't
+	// exhaust the tunnel owner's per-user quota.
+	clientIP := extractIP(r, tm.cfg)
+	if !rl.Acquire(clientIP, "") {
+		http.Error(w, "too many connections", http.StatusTooManyRequests)
+		return
+	}
+	defer rl.Release(clientIP, "")
+
 	// Generate unique request ID.
 	reqID := generateShortID()
 
-	// Flatten headers.
+	// Flatten headers, stripping sensitive ones that the tunnel owner shouldn't see.
 	headers := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
+		switch strings.ToLower(k) {
+		case "cookie", "authorization", "proxy-authorization",
+			"set-cookie", "x-csrf-token", "x-xsrf-token":
+			continue
+		}
 		headers[k] = strings.Join(v, ", ")
 	}
 
-	// Read body.
+	// Read body — encode as base64 to preserve binary data through JSON.
 	var body string
+	bodyEncoding := ""
 	if r.Body != nil {
 		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024)) // 10MB limit
-		if err == nil {
-			body = string(bodyBytes)
+		if err == nil && len(bodyBytes) > 0 {
+			body = base64.StdEncoding.EncodeToString(bodyBytes)
+			bodyEncoding = "base64"
 		}
 	}
 
@@ -291,30 +362,73 @@ func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request
 
 	// Send HTTP request to browser.
 	httpReq := HTTPRequest{
-		Type:    "http_request",
-		ID:      reqID,
-		Method:  r.Method,
-		Path:    r.URL.RequestURI(),
-		Headers: headers,
-		Body:    body,
+		Type:         "http_request",
+		ID:           reqID,
+		Method:       r.Method,
+		Path:         r.URL.RequestURI(),
+		Headers:      headers,
+		Body:         body,
+		BodyEncoding: bodyEncoding,
 	}
 	reqJSON, _ := json.Marshal(httpReq)
-	if err := tunnel.WS.Write(tunnel.Ctx, websocket.MessageText, reqJSON); err != nil {
+	if err := tunnel.writeWS(websocket.MessageText, reqJSON); err != nil {
 		http.Error(w, "tunnel write failed", http.StatusBadGateway)
 		return
 	}
 
-	// Wait for response from browser.
+	// Wait for response from browser, or tunnel disconnect.
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
 	select {
+	case <-tunnel.Ctx.Done():
+		http.Error(w, "tunnel disconnected", http.StatusBadGateway)
+		return
 	case resp := <-respCh:
-		for k, v := range resp.Headers {
-			w.Header().Set(k, v)
+		// Validate status code to prevent panics from malformed responses.
+		status := resp.Status
+		if status < 100 || status > 999 {
+			http.Error(w, "invalid response from tunnel", http.StatusBadGateway)
+			return
 		}
-		w.WriteHeader(resp.Status)
-		w.Write([]byte(resp.Body))
+		// Set headers, filtering out hop-by-hop and security-sensitive headers.
+		// The browser controls these headers — don't let it set cookies,
+		// override CORS, or manipulate security policies on the tunnel domain.
+		headerCount := 0
+		for k, v := range resp.Headers {
+			if headerCount >= 100 {
+				break // Limit total headers to prevent memory exhaustion.
+			}
+			// Reject headers with \r or \n to prevent header injection.
+			if strings.ContainsAny(k, "\r\n") || strings.ContainsAny(v, "\r\n") {
+				continue
+			}
+			switch strings.ToLower(k) {
+			case "connection", "keep-alive", "transfer-encoding", "upgrade",
+				"set-cookie", "set-cookie2",
+				"access-control-allow-origin", "access-control-allow-credentials",
+				"access-control-allow-methods", "access-control-allow-headers",
+				"strict-transport-security",
+				"content-security-policy", "content-security-policy-report-only",
+				"x-frame-options", "x-content-type-options", "x-xss-protection",
+				"public-key-pins", "public-key-pins-report-only":
+				continue
+			}
+			w.Header().Set(k, v)
+			headerCount++
+		}
+		w.WriteHeader(status)
+		// Decode body if base64-encoded.
+		if resp.BodyEncoding == "base64" {
+			decoded, err := base64.StdEncoding.DecodeString(resp.Body)
+			if err == nil {
+				w.Write(decoded)
+			} else {
+				w.Write([]byte(resp.Body))
+			}
+		} else {
+			w.Write([]byte(resp.Body))
+		}
 
 	case <-ctx.Done():
 		http.Error(w, "tunnel response timeout", http.StatusGatewayTimeout)
@@ -324,7 +438,7 @@ func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request
 // serveTCPPort listens on a raw TCP port and multiplexes connections
 // through the tunnel WebSocket.
 func (tm *TunnelManager) serveTCPPort(tunnel *Tunnel, port int) {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		slog.Error("tunnel tcp listen failed", "port", port, "err", err)
 		return
@@ -337,12 +451,25 @@ func (tm *TunnelManager) serveTCPPort(tunnel *Tunnel, port int) {
 		listener.Close()
 	}()
 
+	// Limit concurrent TCP connections per tunnel to prevent goroutine exhaustion.
+	const maxTCPConnsPerTunnel = 100
+	sem := make(chan struct{}, maxTCPConnsPerTunnel)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			return // Listener closed.
 		}
-		go tm.handleTCPConn(tunnel, conn)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				tm.handleTCPConn(tunnel, conn)
+			}()
+		default:
+			// At limit — reject connection.
+			conn.Close()
+		}
 	}
 }
 
@@ -357,7 +484,7 @@ func (tm *TunnelManager) handleTCPConn(tunnel *Tunnel, conn net.Conn) {
 	// Notify browser of new TCP connection.
 	openMsg := TCPOpen{Type: "tcp_open", ConnID: connID}
 	openJSON, _ := json.Marshal(openMsg)
-	if err := tunnel.WS.Write(tunnel.Ctx, websocket.MessageText, openJSON); err != nil {
+	if err := tunnel.writeWS(websocket.MessageText, openJSON); err != nil {
 		return
 	}
 
@@ -365,10 +492,11 @@ func (tm *TunnelManager) handleTCPConn(tunnel *Tunnel, conn net.Conn) {
 	// Binary frames are prefixed: [4 bytes connID length][connID][payload]
 	buf := make([]byte, 32*1024)
 	for {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := conn.Read(buf)
 		if n > 0 {
 			frame := buildBinaryFrame(connID, buf[:n])
-			if writeErr := tunnel.WS.Write(tunnel.Ctx, websocket.MessageBinary, frame); writeErr != nil {
+			if writeErr := tunnel.writeWS(websocket.MessageBinary, frame); writeErr != nil {
 				return
 			}
 		}
@@ -376,7 +504,7 @@ func (tm *TunnelManager) handleTCPConn(tunnel *Tunnel, conn net.Conn) {
 			// Notify browser that TCP connection closed.
 			closeMsg := TCPClose{Type: "tcp_close", ConnID: connID}
 			closeJSON, _ := json.Marshal(closeMsg)
-			tunnel.WS.Write(tunnel.Ctx, websocket.MessageText, closeJSON)
+			tunnel.writeWS(websocket.MessageText, closeJSON)
 			return
 		}
 	}
@@ -414,6 +542,7 @@ func (tm *TunnelManager) allocatePort() int {
 			return p
 		}
 	}
+	slog.Warn("tunnel port exhaustion: no ports available", "rangeMin", tm.cfg.TunnelPortMin, "rangeMax", tm.cfg.TunnelPortMax)
 	return 0 // No ports available.
 }
 
@@ -428,9 +557,9 @@ func (tm *TunnelManager) releasePort(port int) {
 // Helpers
 // ────────────────────────────────────────────────────────────────────
 
-// generateSubdomain creates a random 8-character hex subdomain.
+// generateSubdomain creates a random 16-character hex subdomain (64-bit entropy).
 func generateSubdomain() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
@@ -455,4 +584,17 @@ func buildBinaryFrame(connID string, payload []byte) []byte {
 	copy(frame[4:], idBytes)
 	copy(frame[4+idLen:], payload)
 	return frame
+}
+
+// parseBinaryFrame extracts connID and payload from a binary TCP frame.
+// Format: [4B connID len (big-endian)][connID bytes][payload bytes]
+func parseBinaryFrame(data []byte) (connID string, payload []byte) {
+	if len(data) < 4 {
+		return "", nil
+	}
+	idLen := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if idLen <= 0 || idLen > 256 || 4+idLen > len(data) {
+		return "", nil
+	}
+	return string(data[4 : 4+idLen]), data[4+idLen:]
 }

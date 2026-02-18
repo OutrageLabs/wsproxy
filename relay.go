@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -34,6 +36,13 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 			return
 		}
 
+		// Validate port is a valid TCP port number.
+		portNum, err := strconv.Atoi(portStr)
+		if err != nil || portNum < 1 || portNum > 65535 {
+			http.Error(w, "invalid port (must be 1-65535)", http.StatusBadRequest)
+			return
+		}
+
 		target := net.JoinHostPort(host, portStr)
 
 		// Authenticate.
@@ -52,7 +61,7 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		}
 
 		// Rate limit.
-		clientIP := extractIP(r)
+		clientIP := extractIP(r, cfg)
 		if !rl.Acquire(clientIP, userID) {
 			slog.Warn("relay rate limited", "ip", clientIP, "user", userID)
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
@@ -70,8 +79,13 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		}
 		defer wsConn.CloseNow()
 
-		// Dial the target SSH server.
-		tcpConn, err := net.DialTimeout("tcp", target, tcpDialTimeout)
+		// Limit maximum message size to prevent OOM.
+		wsConn.SetReadLimit(1 * 1024 * 1024) // 1 MB (SSH packets are max ~35 KB)
+
+		// Dial the target SSH server via SafeDial (checks resolved IP against blocklist).
+		dialCtx, dialCancel := context.WithTimeout(r.Context(), tcpDialTimeout)
+		defer dialCancel()
+		tcpConn, err := cfg.SafeDial(dialCtx, "tcp", target)
 		if err != nil {
 			slog.Error("relay tcp dial failed", "target", target, "err", err)
 			wsConn.Close(websocket.StatusInternalError, "cannot reach target")
@@ -134,33 +148,26 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 	}
 }
 
-// extractIP gets the client IP from the request, preferring X-Forwarded-For
-// (for use behind Caddy/nginx).
-func extractIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP (closest to client).
-		if i := len(xff); i > 0 {
-			parts := splitFirst(xff, ",")
-			return parts
+// extractIP gets the client IP from the request.
+// X-Forwarded-For and X-Real-IP are only trusted when the direct connection
+// comes from a configured trusted proxy. Otherwise, RemoteAddr is used.
+func extractIP(r *http.Request, cfg *Config) string {
+	directIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		directIP = r.RemoteAddr
+	}
+
+	// Only trust proxy headers from configured trusted proxies.
+	if cfg != nil && cfg.IsTrustedProxy(directIP) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.SplitN(xff, ",", 2)
+			return strings.TrimSpace(parts[0])
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
 		}
 	}
-	if xff := r.Header.Get("X-Real-IP"); xff != "" {
-		return xff
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+
+	return directIP
 }
 
-// splitFirst returns the part before the first occurrence of sep,
-// or the full string if sep is not found.
-func splitFirst(s, sep string) string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep[0] {
-			return s[:i]
-		}
-	}
-	return s
-}

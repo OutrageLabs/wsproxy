@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 var cryptoSHA256 = crypto.SHA256
@@ -27,34 +30,81 @@ var (
 
 // Auth handles JWT validation using Clerk's JWKS endpoint.
 type Auth struct {
-	jwksURL  string
-	mu       sync.RWMutex
-	keys     map[string]*rsa.PublicKey // kid → public key
+	jwksURL   string
+	issuer    string // Expected iss claim (empty = skip)
+	audience  string // Expected aud claim (empty = skip)
+	mu        sync.RWMutex
+	keys      map[string]*rsa.PublicKey // kid → public key
 	fetchedAt time.Time
-	cacheTTL time.Duration
+	cacheTTL  time.Duration
+	sfGroup   singleflight.Group
 }
 
 // NewAuth creates a new JWT authenticator. If jwksURL is empty, auth is disabled
 // (all requests pass — useful for development).
-func NewAuth(jwksURL string) *Auth {
-	return &Auth{
+func NewAuth(jwksURL string, opts ...AuthOption) *Auth {
+	a := &Auth{
 		jwksURL:  jwksURL,
 		keys:     make(map[string]*rsa.PublicKey),
 		cacheTTL: 15 * time.Minute,
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
+}
+
+// AuthOption configures optional Auth parameters.
+type AuthOption func(*Auth)
+
+// WithIssuer sets the expected JWT issuer (iss claim).
+func WithIssuer(iss string) AuthOption {
+	return func(a *Auth) { a.issuer = iss }
+}
+
+// WithAudience sets the expected JWT audience (aud claim).
+func WithAudience(aud string) AuthOption {
+	return func(a *Auth) { a.audience = aud }
 }
 
 // Claims holds the validated JWT claims we care about.
 type Claims struct {
-	Sub string `json:"sub"` // Clerk user ID
-	Exp int64  `json:"exp"`
-	Iss string `json:"iss"`
-	Aud string `json:"aud"`
+	Sub    string          `json:"sub"` // Clerk user ID
+	Exp    int64           `json:"exp"`
+	Nbf    int64           `json:"nbf"` // not-before (RFC 7519 §4.1.5)
+	Iss    string          `json:"iss"`
+	RawAud json.RawMessage `json:"aud"` // can be string or []string per RFC 7519
+}
+
+// Audiences returns the aud claim as a string slice, handling both
+// the string and array formats allowed by RFC 7519.
+func (c *Claims) Audiences() []string {
+	if len(c.RawAud) == 0 {
+		return nil
+	}
+	// Try string first.
+	var s string
+	if err := json.Unmarshal(c.RawAud, &s); err == nil {
+		return []string{s}
+	}
+	// Try array.
+	var arr []string
+	if err := json.Unmarshal(c.RawAud, &arr); err == nil {
+		return arr
+	}
+	return nil
 }
 
 // Authenticate extracts and validates the JWT from the request.
 // Token can be in query param "token" or Authorization header.
 // Returns the user ID (sub claim) on success.
+//
+// SECURITY NOTE: The "token" query parameter is necessary because browsers
+// cannot set custom headers during WebSocket upgrade. This means the JWT
+// may appear in server access logs. Operators should:
+// 1. Use short-lived tokens (Clerk defaults to 60s)
+// 2. Ensure reverse proxy access logs are protected
+// 3. Use wss:// (TLS) to prevent token interception in transit
 func (a *Auth) Authenticate(r *http.Request) (string, error) {
 	if a.jwksURL == "" {
 		return "anonymous", nil // Auth disabled for dev.
@@ -126,8 +176,29 @@ func (a *Auth) validateJWT(token string) (*Claims, error) {
 		return nil, fmt.Errorf("auth: parse claims: %w", err)
 	}
 
-	if time.Now().Unix() > claims.Exp {
+	now := time.Now().Unix()
+	if now > claims.Exp {
 		return nil, errTokenExpired
+	}
+	if claims.Nbf > 0 && now < claims.Nbf {
+		return nil, fmt.Errorf("auth: token not yet valid (nbf=%d, now=%d)", claims.Nbf, now)
+	}
+
+	if a.issuer != "" && claims.Iss != a.issuer {
+		return nil, fmt.Errorf("auth: invalid issuer %q, expected %q", claims.Iss, a.issuer)
+	}
+	if a.audience != "" {
+		audiences := claims.Audiences()
+		found := false
+		for _, aud := range audiences {
+			if aud == a.audience {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("auth: token audience %v does not contain %q", audiences, a.audience)
+		}
 	}
 
 	return &claims, nil
@@ -145,13 +216,16 @@ func (a *Auth) getKey(kid string) (*rsa.PublicKey, error) {
 		return key, nil
 	}
 
-	// Refresh JWKS.
-	if err := a.fetchJWKS(); err != nil {
+	// Refresh JWKS (deduped via singleflight to avoid thundering herd).
+	_, sfErr, _ := a.sfGroup.Do("jwks", func() (any, error) {
+		return nil, a.fetchJWKS()
+	})
+	if sfErr != nil {
 		// If we have a cached key, use it even if stale.
 		if ok {
 			return key, nil
 		}
-		return nil, fmt.Errorf("auth: fetch JWKS: %w", err)
+		return nil, fmt.Errorf("auth: fetch JWKS: %w", sfErr)
 	}
 
 	a.mu.RLock()
@@ -191,8 +265,9 @@ func (a *Auth) fetchJWKS() error {
 		return fmt.Errorf("JWKS endpoint returned %d", resp.StatusCode)
 	}
 
+	// Limit JWKS response to 1 MB to prevent OOM from malicious/misconfigured endpoints.
 	var jwks jwksResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&jwks); err != nil {
 		return err
 	}
 

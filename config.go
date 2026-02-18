@@ -1,24 +1,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // Config holds all server configuration, loaded from environment variables.
 type Config struct {
 	Port            int
 	ClerkJWKSURL    string
+	JWTIssuer       string // Expected JWT iss claim (empty = skip check)
+	JWTAudience     string // Expected JWT aud claim (empty = skip check)
 	AllowedOrigins  []string
 	TunnelDomain    string
 	TunnelPortMin   int
 	TunnelPortMax   int
-	MaxConnsPerIP   int
-	MaxConnsPerUser int
+	MaxConnsPerIP        int
+	MaxConnsPerUser      int
+	MaxTunnelHTTPPerIP   int // Separate limit for tunnel HTTP requests
 	BlockedNets     []*net.IPNet
+	TrustedProxies  []*net.IPNet // CIDRs whose X-Forwarded-For headers are trusted
 }
 
 // LoadConfig reads configuration from environment variables with defaults.
@@ -26,16 +33,19 @@ func LoadConfig() (*Config, error) {
 	c := &Config{
 		Port:            envInt("PORT", 8080),
 		ClerkJWKSURL:    envStr("CLERK_JWKS_URL", ""),
+		JWTIssuer:       envStr("JWT_ISSUER", ""),
+		JWTAudience:     envStr("JWT_AUDIENCE", ""),
 		AllowedOrigins:  envList("ALLOWED_ORIGINS", []string{"*"}),
 		TunnelDomain:    envStr("TUNNEL_DOMAIN", ""),
 		TunnelPortMin:   envInt("TUNNEL_PORT_MIN", 10000),
 		TunnelPortMax:   envInt("TUNNEL_PORT_MAX", 10100),
-		MaxConnsPerIP:   envInt("MAX_CONNS_PER_IP", 10),
-		MaxConnsPerUser: envInt("MAX_CONNS_PER_USER", 20),
+		MaxConnsPerIP:      envInt("MAX_CONNS_PER_IP", 10),
+		MaxConnsPerUser:    envInt("MAX_CONNS_PER_USER", 20),
+		MaxTunnelHTTPPerIP: envInt("MAX_TUNNEL_HTTP_PER_IP", 50),
 	}
 
 	// Parse blocked target networks.
-	defaultBlocked := "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1/128,fc00::/7,fe80::/10"
+	defaultBlocked := "0.0.0.0/8,127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,198.18.0.0/15,::1/128,fc00::/7,fe80::/10"
 	blockedStr := envStr("BLOCKED_TARGETS", defaultBlocked)
 	for _, cidr := range strings.Split(blockedStr, ",") {
 		cidr = strings.TrimSpace(cidr)
@@ -49,6 +59,22 @@ func LoadConfig() (*Config, error) {
 		c.BlockedNets = append(c.BlockedNets, ipNet)
 	}
 
+	// Parse trusted proxy CIDRs (e.g., "10.0.0.0/8,172.16.0.0/12").
+	// Only requests from these IPs will have X-Forwarded-For / X-Real-IP honored.
+	if trustedStr := envStr("TRUSTED_PROXIES", ""); trustedStr != "" {
+		for _, cidr := range strings.Split(trustedStr, ",") {
+			cidr = strings.TrimSpace(cidr)
+			if cidr == "" {
+				continue
+			}
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid TRUSTED_PROXIES CIDR %q: %w", cidr, err)
+			}
+			c.TrustedProxies = append(c.TrustedProxies, ipNet)
+		}
+	}
+
 	if c.TunnelPortMin >= c.TunnelPortMax {
 		return nil, fmt.Errorf("TUNNEL_PORT_MIN (%d) must be less than TUNNEL_PORT_MAX (%d)", c.TunnelPortMin, c.TunnelPortMax)
 	}
@@ -58,22 +84,72 @@ func LoadConfig() (*Config, error) {
 
 // IsTargetBlocked checks if a host IP falls within any blocked network range.
 // Returns true if the target should be rejected.
+// Note: SafeDial also checks resolved IPs, preventing DNS rebinding.
+// This pre-check provides fast rejection before attempting a TCP connection.
 func (c *Config) IsTargetBlocked(host string) bool {
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		// If we can't resolve, check if it's a raw IP.
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return true // Can't resolve and not an IP — block it.
-		}
-		ips = []net.IP{ip}
-	}
-
-	for _, ip := range ips {
+	// First check if it's a raw IP.
+	if ip := net.ParseIP(host); ip != nil {
 		for _, blocked := range c.BlockedNets {
 			if blocked.Contains(ip) {
 				return true
 			}
+		}
+		return false
+	}
+
+	// DNS lookup with timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return true // Can't resolve — block it.
+	}
+
+	for _, addr := range ips {
+		for _, blocked := range c.BlockedNets {
+			if blocked.Contains(addr.IP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SafeDial dials a TCP connection after verifying the resolved IP is not blocked.
+// This prevents DNS rebinding attacks where the first resolution (IsTargetBlocked)
+// returns a safe IP but a second resolution (net.Dial) returns a blocked IP.
+func (c *Config) SafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(network, address string, rawConn syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("invalid address %q: %w", address, err)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("resolved address %q is not an IP", host)
+			}
+			for _, blocked := range c.BlockedNets {
+				if blocked.Contains(ip) {
+					return fmt.Errorf("resolved IP %s is in blocked range %s", ip, blocked)
+				}
+			}
+			return nil
+		},
+	}
+	return d.DialContext(ctx, network, addr)
+}
+
+// IsTrustedProxy checks if the given IP belongs to a trusted proxy network.
+func (c *Config) IsTrustedProxy(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range c.TrustedProxies {
+		if cidr.Contains(parsed) {
+			return true
 		}
 	}
 	return false

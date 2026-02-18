@@ -15,6 +15,7 @@ type RateLimiter struct {
 	mu      sync.Mutex
 	byIP    map[string]int
 	byUser  map[string]int
+	stopCh  chan struct{}
 }
 
 // NewRateLimiter creates a rate limiter with the specified connection caps.
@@ -24,18 +25,34 @@ func NewRateLimiter(maxPerIP, maxPerUser int) *RateLimiter {
 		maxPerUser: maxPerUser,
 		byIP:       make(map[string]int),
 		byUser:     make(map[string]int),
+		stopCh:     make(chan struct{}),
 	}
 
 	// Periodic cleanup of zero-count entries to prevent unbounded map growth.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			rl.cleanup()
+		for {
+			select {
+			case <-ticker.C:
+				rl.cleanup()
+			case <-rl.stopCh:
+				return
+			}
 		}
 	}()
 
 	return rl
+}
+
+// Stop terminates the background cleanup goroutine.
+func (rl *RateLimiter) Stop() {
+	select {
+	case <-rl.stopCh:
+		// Already stopped.
+	default:
+		close(rl.stopCh)
+	}
 }
 
 // Acquire attempts to take a connection slot for the given IP and user.

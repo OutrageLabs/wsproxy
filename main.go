@@ -24,14 +24,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	auth := NewAuth(cfg.ClerkJWKSURL)
+	var authOpts []AuthOption
+	if cfg.JWTIssuer != "" {
+		authOpts = append(authOpts, WithIssuer(cfg.JWTIssuer))
+	}
+	if cfg.JWTAudience != "" {
+		authOpts = append(authOpts, WithAudience(cfg.JWTAudience))
+	}
+	auth := NewAuth(cfg.ClerkJWKSURL, authOpts...)
 	rl := NewRateLimiter(cfg.MaxConnsPerIP, cfg.MaxConnsPerUser)
+	tunnelHTTPRL := NewRateLimiter(cfg.MaxTunnelHTTPPerIP, cfg.MaxConnsPerUser)
 	tm := NewTunnelManager(cfg)
 
 	mux := http.NewServeMux()
 
 	// Health check — no auth, no rate limit.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -46,7 +55,7 @@ func main() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a tunnel subdomain request.
 		if cfg.TunnelDomain != "" && isTunnelSubdomain(r.Host, cfg.TunnelDomain) {
-			tm.HandleTunnelHTTP(w, r)
+			tm.HandleTunnelHTTP(w, r, tunnelHTTPRL)
 			return
 		}
 		// Otherwise, use the standard mux.
@@ -57,11 +66,11 @@ func main() {
 	corsHandler := corsMiddleware(cfg.AllowedOrigins, handler)
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      corsHandler,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 0, // WebSocket connections are long-lived.
-		IdleTimeout:  120 * time.Second,
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           corsHandler,
+		ReadHeaderTimeout: 5 * time.Second, // Only limit header read, not full body (WebSocket upgrade needs open read).
+		WriteTimeout:      0,               // WebSocket connections are long-lived.
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
@@ -86,6 +95,8 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	server.Shutdown(shutdownCtx)
+	rl.Stop()
+	tunnelHTTPRL.Stop()
 
 	slog.Info("wsproxy stopped")
 }
