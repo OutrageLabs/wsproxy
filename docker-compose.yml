@@ -1,0 +1,26 @@
+services:
+  wsproxy:
+    build: .
+    ports:
+      - "8080:8080"
+      - "10000-10100:10000-10100"   # Raw TCP tunnel ports
+    environment:
+      PORT: "8080"
+      # CLERK_JWKS_URL: "https://your-clerk-domain.clerk.accounts.dev/.well-known/jwks.json"
+      ALLOWED_ORIGINS: "*"
+      # TUNNEL_DOMAIN: "tunnel.example.com"
+      TUNNEL_PORT_MIN: "10000"
+      TUNNEL_PORT_MAX: "10100"
+      MAX_CONNS_PER_IP: "10"
+      MAX_CONNS_PER_USER: "20"
+    restart: unless-stopped
+
+  # Example: Caddy reverse proxy for TLS termination + wildcard subdomain routing
+  # caddy:
+  #   image: caddy:2-alpine
+  #   ports:
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile
+  #   depends_on:
+  #     - wsproxy
