@@ -111,13 +111,18 @@ All configuration via environment variables:
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP/WebSocket listen port |
 | `CLERK_JWKS_URL` | _(empty = auth disabled)_ | Clerk JWKS endpoint for JWT validation |
+| `JWT_ISSUER` | _(empty)_ | Expected JWT `iss` claim |
+| `JWT_AUDIENCE` | _(empty)_ | Expected JWT `aud` claim |
 | `ALLOWED_ORIGINS` | `*` | CORS allowed origins (comma-separated) |
 | `TUNNEL_DOMAIN` | _(empty = tunneling disabled)_ | Base domain for tunnel subdomains |
 | `TUNNEL_PORT_MIN` | `10000` | Start of raw TCP port range |
 | `TUNNEL_PORT_MAX` | `10100` | End of raw TCP port range |
 | `MAX_CONNS_PER_IP` | `10` | Max concurrent connections per IP |
 | `MAX_CONNS_PER_USER` | `20` | Max concurrent connections per user |
+| `MAX_TUNNEL_HTTP_PER_IP` | `50` | Max concurrent tunnel HTTP requests per source IP |
+| `MAX_TUNNEL_TCP_CONNS_GLOBAL` | `1000` | Max concurrent raw TCP connections across all tunnels |
 | `BLOCKED_TARGETS` | RFC 1918 + loopback | Blocked target IP ranges (CIDR) |
+| `TRUSTED_PROXIES` | _(empty)_ | Comma-separated proxy CIDRs allowed to set `X-Forwarded-For` / `X-Real-IP` |
 
 ## Production Deployment
 

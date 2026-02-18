@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,13 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+)
+
+const (
+	maxTunnelHeaders            = 100
+	maxTunnelHeaderValueLen     = 8 * 1024
+	maxTunnelResponseBodyBytes  = 10 * 1024 * 1024
+	maxTunnelBinaryConnIDLength = 64
 )
 
 // ────────────────────────────────────────────────────────────────────
@@ -42,9 +50,9 @@ type HTTPRequest struct {
 
 // HTTPResponse is sent browser → proxy as response to an HTTPRequest.
 type HTTPResponse struct {
-	Type         string            `json:"type"`                   // "http_response"
-	ID           string            `json:"id"`                     // matches HTTPRequest.ID
-	Status       int               `json:"status"`                 // 200, 404, etc.
+	Type         string            `json:"type"`   // "http_response"
+	ID           string            `json:"id"`     // matches HTTPRequest.ID
+	Status       int               `json:"status"` // 200, 404, etc.
 	Headers      map[string]string `json:"headers"`
 	Body         string            `json:"body"`                   // text or base64-encoded
 	BodyEncoding string            `json:"bodyEncoding,omitempty"` // "base64" if body is encoded
@@ -58,7 +66,7 @@ type TCPOpen struct {
 
 // TCPClose is sent in either direction when a TCP connection ends.
 type TCPClose struct {
-	Type   string `json:"type"`   // "tcp_close"
+	Type   string `json:"type"` // "tcp_close"
 	ConnID string `json:"connId"`
 }
 
@@ -85,8 +93,8 @@ type Tunnel struct {
 	wsMu sync.Mutex
 
 	// Pending HTTP requests waiting for responses from the browser.
-	mu       sync.Mutex
-	pending  map[string]chan *HTTPResponse
+	mu      sync.Mutex
+	pending map[string]chan *HTTPResponse
 
 	// Raw TCP connections multiplexed over this tunnel.
 	tcpConns sync.Map // connID → net.Conn
@@ -109,6 +117,9 @@ type TunnelManager struct {
 	mu      sync.RWMutex
 	tunnels map[string]*Tunnel // subdomain → tunnel
 
+	// Global TCP connection cap across all active tunnels.
+	tcpConnSem chan struct{}
+
 	// Port allocation.
 	portMu    sync.Mutex
 	usedPorts map[int]bool
@@ -116,10 +127,15 @@ type TunnelManager struct {
 
 // NewTunnelManager creates a tunnel manager.
 func NewTunnelManager(cfg *Config) *TunnelManager {
+	globalCap := cfg.MaxTunnelTCPConnsGlobal
+	if globalCap <= 0 {
+		globalCap = 1000
+	}
 	return &TunnelManager{
-		cfg:       cfg,
-		tunnels:   make(map[string]*Tunnel),
-		usedPorts: make(map[int]bool),
+		cfg:        cfg,
+		tunnels:    make(map[string]*Tunnel),
+		tcpConnSem: make(chan struct{}, globalCap),
+		usedPorts:  make(map[int]bool),
 	}
 }
 
@@ -207,7 +223,7 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 			return
 		}
 
-		slog.Info("tunnel registered", "subdomain", subdomain, "rawPort", rawPort, "user", userID)
+		slog.Info("tunnel registered", "subdomain", subdomain, "rawPort", rawPort)
 
 		// Start raw TCP listener if port allocated.
 		if rawPort > 0 {
@@ -244,17 +260,23 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 			// Binary frames carry TCP data: [4B connID len][connID][payload]
 			if msgType == websocket.MessageBinary {
 				connID, payload := parseBinaryFrame(data)
-				if connID != "" && len(payload) > 0 {
+				if connID != "" && len(payload) > 0 && isHexSubdomain(connID, 12) {
 					if conn, ok := tunnel.tcpConns.Load(connID); ok {
 						tcpConn := conn.(net.Conn)
-						tcpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+						if err := tcpConn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+							tunnel.tcpConns.Delete(connID)
+							_ = tcpConn.Close()
+							continue
+						}
 						if _, err := tcpConn.Write(payload); err != nil {
 							// Write failed — close the TCP connection and notify browser.
 							tunnel.tcpConns.Delete(connID)
-							tcpConn.Close()
+							_ = tcpConn.Close()
 							closeMsg := TCPClose{Type: "tcp_close", ConnID: connID}
 							closeJSON, _ := json.Marshal(closeMsg)
-							tunnel.writeWS(websocket.MessageText, closeJSON)
+							if writeErr := tunnel.writeWS(websocket.MessageText, closeJSON); writeErr != nil {
+								slog.Debug("tunnel tcp close notify failed", "err", writeErr)
+							}
 						}
 					}
 				}
@@ -272,8 +294,14 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 				if err := json.Unmarshal(data, &resp); err != nil {
 					continue
 				}
+				if !isHexSubdomain(resp.ID, 12) {
+					continue
+				}
 				tunnel.mu.Lock()
 				ch, ok := tunnel.pending[resp.ID]
+				if ok {
+					delete(tunnel.pending, resp.ID)
+				}
 				tunnel.mu.Unlock()
 				if ok {
 					select {
@@ -287,8 +315,11 @@ func (tm *TunnelManager) HandleTunnelRegister(auth *Auth, rl *RateLimiter) http.
 				if err := json.Unmarshal(data, &tc); err != nil {
 					continue
 				}
+				if !isHexSubdomain(tc.ConnID, 12) {
+					continue
+				}
 				if conn, ok := tunnel.tcpConns.LoadAndDelete(tc.ConnID); ok {
-					conn.(net.Conn).Close()
+					_ = conn.(net.Conn).Close()
 				}
 			}
 		}
@@ -396,15 +427,15 @@ func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request
 		// override CORS, or manipulate security policies on the tunnel domain.
 		headerCount := 0
 		for k, v := range resp.Headers {
-			if headerCount >= 100 {
+			if headerCount >= maxTunnelHeaders {
 				break // Limit total headers to prevent memory exhaustion.
 			}
-			// Reject headers with \r or \n to prevent header injection.
-			if strings.ContainsAny(k, "\r\n") || strings.ContainsAny(v, "\r\n") {
+			if !isValidHTTPHeaderName(k) || !isSafeHTTPHeaderValue(v) {
 				continue
 			}
 			switch strings.ToLower(k) {
 			case "connection", "keep-alive", "transfer-encoding", "upgrade",
+				"te", "trailer", "content-length",
 				"set-cookie", "set-cookie2",
 				"access-control-allow-origin", "access-control-allow-credentials",
 				"access-control-allow-methods", "access-control-allow-headers",
@@ -419,15 +450,26 @@ func (tm *TunnelManager) HandleTunnelHTTP(w http.ResponseWriter, r *http.Request
 		}
 		w.WriteHeader(status)
 		// Decode body if base64-encoded.
+		var body []byte
 		if resp.BodyEncoding == "base64" {
 			decoded, err := base64.StdEncoding.DecodeString(resp.Body)
-			if err == nil {
-				w.Write(decoded)
-			} else {
-				w.Write([]byte(resp.Body))
+			if err != nil {
+				http.Error(w, "invalid base64 response from tunnel", http.StatusBadGateway)
+				return
 			}
+			body = decoded
+		} else if resp.BodyEncoding == "" {
+			body = []byte(resp.Body)
 		} else {
-			w.Write([]byte(resp.Body))
+			http.Error(w, "invalid body encoding from tunnel", http.StatusBadGateway)
+			return
+		}
+		if len(body) > maxTunnelResponseBodyBytes {
+			http.Error(w, "tunnel response too large", http.StatusBadGateway)
+			return
+		}
+		if _, err := w.Write(body); err != nil {
+			slog.Warn("tunnel response write failed", "err", err)
 		}
 
 	case <-ctx.Done():
@@ -448,7 +490,7 @@ func (tm *TunnelManager) serveTCPPort(tunnel *Tunnel, port int) {
 	// Close listener when tunnel context is done.
 	go func() {
 		<-tunnel.Ctx.Done()
-		listener.Close()
+		_ = listener.Close()
 	}()
 
 	// Limit concurrent TCP connections per tunnel to prevent goroutine exhaustion.
@@ -462,13 +504,21 @@ func (tm *TunnelManager) serveTCPPort(tunnel *Tunnel, port int) {
 		}
 		select {
 		case sem <- struct{}{}:
+			if !tm.tryAcquireGlobalTCPSlot() {
+				<-sem
+				_ = conn.Close()
+				continue
+			}
 			go func() {
-				defer func() { <-sem }()
+				defer func() {
+					tm.releaseGlobalTCPSlot()
+					<-sem
+				}()
 				tm.handleTCPConn(tunnel, conn)
 			}()
 		default:
 			// At limit — reject connection.
-			conn.Close()
+			_ = conn.Close()
 		}
 	}
 }
@@ -492,10 +542,15 @@ func (tm *TunnelManager) handleTCPConn(tunnel *Tunnel, conn net.Conn) {
 	// Binary frames are prefixed: [4 bytes connID length][connID][payload]
 	buf := make([]byte, 32*1024)
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			return
+		}
 		n, err := conn.Read(buf)
 		if n > 0 {
 			frame := buildBinaryFrame(connID, buf[:n])
+			if len(frame) == 0 {
+				return
+			}
 			if writeErr := tunnel.writeWS(websocket.MessageBinary, frame); writeErr != nil {
 				return
 			}
@@ -504,7 +559,9 @@ func (tm *TunnelManager) handleTCPConn(tunnel *Tunnel, conn net.Conn) {
 			// Notify browser that TCP connection closed.
 			closeMsg := TCPClose{Type: "tcp_close", ConnID: connID}
 			closeJSON, _ := json.Marshal(closeMsg)
-			tunnel.writeWS(websocket.MessageText, closeJSON)
+			if writeErr := tunnel.writeWS(websocket.MessageText, closeJSON); writeErr != nil {
+				slog.Debug("tunnel tcp close notify failed", "err", writeErr)
+			}
 			return
 		}
 	}
@@ -516,15 +573,12 @@ func (tm *TunnelManager) extractSubdomain(host string) string {
 	if tm.cfg.TunnelDomain == "" {
 		return ""
 	}
-	// Strip port if present.
-	h, _, _ := net.SplitHostPort(host)
-	if h == "" {
-		h = host
-	}
-	suffix := "." + tm.cfg.TunnelDomain
+	h := canonicalHost(host)
+	tunnelDomain := canonicalHost(tm.cfg.TunnelDomain)
+	suffix := "." + tunnelDomain
 	if strings.HasSuffix(h, suffix) {
 		sub := strings.TrimSuffix(h, suffix)
-		if sub != "" && !strings.Contains(sub, ".") {
+		if !strings.Contains(sub, ".") && isHexSubdomain(sub, 16) {
 			return sub
 		}
 	}
@@ -553,6 +607,22 @@ func (tm *TunnelManager) releasePort(port int) {
 	delete(tm.usedPorts, port)
 }
 
+func (tm *TunnelManager) tryAcquireGlobalTCPSlot() bool {
+	select {
+	case tm.tcpConnSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (tm *TunnelManager) releaseGlobalTCPSlot() {
+	select {
+	case <-tm.tcpConnSem:
+	default:
+	}
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────
@@ -576,11 +646,11 @@ func generateShortID() string {
 func buildBinaryFrame(connID string, payload []byte) []byte {
 	idBytes := []byte(connID)
 	idLen := len(idBytes)
+	if idLen <= 0 || idLen > maxTunnelBinaryConnIDLength {
+		return nil
+	}
 	frame := make([]byte, 4+idLen+len(payload))
-	frame[0] = byte(idLen >> 24)
-	frame[1] = byte(idLen >> 16)
-	frame[2] = byte(idLen >> 8)
-	frame[3] = byte(idLen)
+	binary.BigEndian.PutUint32(frame[:4], uint32(idLen))
 	copy(frame[4:], idBytes)
 	copy(frame[4+idLen:], payload)
 	return frame
@@ -592,9 +662,46 @@ func parseBinaryFrame(data []byte) (connID string, payload []byte) {
 	if len(data) < 4 {
 		return "", nil
 	}
-	idLen := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if idLen <= 0 || idLen > 256 || 4+idLen > len(data) {
+	idLen := int(binary.BigEndian.Uint32(data[:4]))
+	if idLen <= 0 || idLen > maxTunnelBinaryConnIDLength {
+		return "", nil
+	}
+	if idLen > len(data)-4 {
 		return "", nil
 	}
 	return string(data[4 : 4+idLen]), data[4+idLen:]
+}
+
+func isValidHTTPHeaderName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isTokenChar := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+			c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+			c == '^' || c == '_' || c == '`' || c == '|' || c == '~'
+		if !isTokenChar {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeHTTPHeaderValue(value string) bool {
+	if len(value) > maxTunnelHeaderValueLen {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r == '\r' || r == '\n' || r == '\u2028' || r == '\u2029' || r == 0:
+			return false
+		case r < 0x20 || r == 0x7f:
+			return false
+		}
+	}
+	return true
 }

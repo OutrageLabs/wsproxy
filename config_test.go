@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 )
 
@@ -47,5 +48,16 @@ func TestIsTargetBlocked(t *testing.T) {
 		if got := cfg.IsTargetBlocked(tt.host); got != tt.blocked {
 			t.Errorf("IsTargetBlocked(%q): got %v, want %v", tt.host, got, tt.blocked)
 		}
+	}
+}
+
+func TestSafeDial_ContextCanceled(t *testing.T) {
+	cfg := &Config{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := cfg.SafeDial(ctx, "tcp", "8.8.8.8:53")
+	if err == nil {
+		t.Fatal("expected dial to fail with canceled context")
 	}
 }

@@ -48,14 +48,14 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		// Authenticate.
 		userID, err := auth.Authenticate(r)
 		if err != nil {
-			slog.Warn("relay auth failed", "err", err, "remote", r.RemoteAddr)
+			slog.Warn("relay auth failed", "err", err)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
 		// Check target blacklist.
 		if cfg.IsTargetBlocked(host) {
-			slog.Warn("relay blocked target", "target", target, "user", userID)
+			slog.Warn("relay blocked target")
 			http.Error(w, "target address not allowed", http.StatusForbidden)
 			return
 		}
@@ -63,7 +63,7 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		// Rate limit.
 		clientIP := extractIP(r, cfg)
 		if !rl.Acquire(clientIP, userID) {
-			slog.Warn("relay rate limited", "ip", clientIP, "user", userID)
+			slog.Warn("relay rate limited")
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
 		}
@@ -87,13 +87,15 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		defer dialCancel()
 		tcpConn, err := cfg.SafeDial(dialCtx, "tcp", target)
 		if err != nil {
-			slog.Error("relay tcp dial failed", "target", target, "err", err)
-			wsConn.Close(websocket.StatusInternalError, "cannot reach target")
+			slog.Error("relay tcp dial failed", "err", err)
+			if closeErr := wsConn.Close(websocket.StatusInternalError, "cannot reach target"); closeErr != nil {
+				slog.Warn("relay websocket close failed", "err", closeErr)
+			}
 			return
 		}
 		defer tcpConn.Close()
 
-		slog.Info("relay started", "target", target, "user", userID, "ip", clientIP)
+		slog.Info("relay started")
 
 		// Bidirectional relay.
 		ctx, cancel := context.WithCancel(r.Context())
@@ -128,7 +130,9 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 			errc <- fmt.Errorf("ws→tcp: %w", err)
 			// Signal TCP that write side is done.
 			if tc, ok := tcpConn.(*net.TCPConn); ok {
-				tc.CloseWrite()
+				if closeErr := tc.CloseWrite(); closeErr != nil {
+					slog.Debug("relay tcp close-write failed", "err", closeErr)
+				}
 			}
 		}()
 
@@ -139,12 +143,14 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		}()
 
 		// Wait for first direction to finish, then cancel the other.
-		firstErr := <-errc
+		<-errc
 		cancel()
 		<-errc // Wait for the second to finish too.
 
-		slog.Info("relay ended", "target", target, "user", userID, "reason", firstErr)
-		wsConn.Close(websocket.StatusNormalClosure, "relay ended")
+		slog.Info("relay ended")
+		if closeErr := wsConn.Close(websocket.StatusNormalClosure, "relay ended"); closeErr != nil {
+			slog.Debug("relay websocket close failed", "err", closeErr)
+		}
 	}
 }
 
@@ -156,18 +162,27 @@ func extractIP(r *http.Request, cfg *Config) string {
 	if err != nil {
 		directIP = r.RemoteAddr
 	}
+	directParsed := normalizeIP(net.ParseIP(strings.TrimSpace(directIP)))
+	if directParsed != nil {
+		directIP = directParsed.String()
+	}
 
 	// Only trust proxy headers from configured trusted proxies.
 	if cfg != nil && cfg.IsTrustedProxy(directIP) {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.SplitN(xff, ",", 2)
-			return strings.TrimSpace(parts[0])
+			candidate := normalizeIP(net.ParseIP(strings.TrimSpace(parts[0])))
+			if candidate != nil {
+				return candidate.String()
+			}
 		}
 		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			return strings.TrimSpace(xri)
+			candidate := normalizeIP(net.ParseIP(strings.TrimSpace(xri)))
+			if candidate != nil {
+				return candidate.String()
+			}
 		}
 	}
 
 	return directIP
 }
-

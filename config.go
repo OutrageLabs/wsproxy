@@ -9,39 +9,42 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // Config holds all server configuration, loaded from environment variables.
 type Config struct {
-	Port            int
-	ClerkJWKSURL    string
-	JWTIssuer       string // Expected JWT iss claim (empty = skip check)
-	JWTAudience     string // Expected JWT aud claim (empty = skip check)
-	AllowedOrigins  []string
-	TunnelDomain    string
-	TunnelPortMin   int
-	TunnelPortMax   int
-	MaxConnsPerIP        int
-	MaxConnsPerUser      int
-	MaxTunnelHTTPPerIP   int // Separate limit for tunnel HTTP requests
-	BlockedNets     []*net.IPNet
-	TrustedProxies  []*net.IPNet // CIDRs whose X-Forwarded-For headers are trusted
+	Port                    int
+	ClerkJWKSURL            string
+	JWTIssuer               string // Expected JWT iss claim (empty = skip check)
+	JWTAudience             string // Expected JWT aud claim (empty = skip check)
+	AllowedOrigins          []string
+	TunnelDomain            string
+	TunnelPortMin           int
+	TunnelPortMax           int
+	MaxConnsPerIP           int
+	MaxConnsPerUser         int
+	MaxTunnelHTTPPerIP      int // Separate limit for tunnel HTTP requests
+	MaxTunnelTCPConnsGlobal int // Global cap across all tunnels.
+	BlockedNets             []*net.IPNet
+	TrustedProxies          []*net.IPNet // CIDRs whose X-Forwarded-For headers are trusted
 }
 
 // LoadConfig reads configuration from environment variables with defaults.
 func LoadConfig() (*Config, error) {
 	c := &Config{
-		Port:            envInt("PORT", 8080),
-		ClerkJWKSURL:    envStr("CLERK_JWKS_URL", ""),
-		JWTIssuer:       envStr("JWT_ISSUER", ""),
-		JWTAudience:     envStr("JWT_AUDIENCE", ""),
-		AllowedOrigins:  envList("ALLOWED_ORIGINS", []string{"*"}),
-		TunnelDomain:    envStr("TUNNEL_DOMAIN", ""),
-		TunnelPortMin:   envInt("TUNNEL_PORT_MIN", 10000),
-		TunnelPortMax:   envInt("TUNNEL_PORT_MAX", 10100),
-		MaxConnsPerIP:      envInt("MAX_CONNS_PER_IP", 10),
-		MaxConnsPerUser:    envInt("MAX_CONNS_PER_USER", 20),
-		MaxTunnelHTTPPerIP: envInt("MAX_TUNNEL_HTTP_PER_IP", 50),
+		Port:                    envInt("PORT", 8080),
+		ClerkJWKSURL:            envStr("CLERK_JWKS_URL", ""),
+		JWTIssuer:               envStr("JWT_ISSUER", ""),
+		JWTAudience:             envStr("JWT_AUDIENCE", ""),
+		AllowedOrigins:          envList("ALLOWED_ORIGINS", []string{"*"}),
+		TunnelDomain:            envStr("TUNNEL_DOMAIN", ""),
+		TunnelPortMin:           envInt("TUNNEL_PORT_MIN", 10000),
+		TunnelPortMax:           envInt("TUNNEL_PORT_MAX", 10100),
+		MaxConnsPerIP:           envInt("MAX_CONNS_PER_IP", 10),
+		MaxConnsPerUser:         envInt("MAX_CONNS_PER_USER", 20),
+		MaxTunnelHTTPPerIP:      envInt("MAX_TUNNEL_HTTP_PER_IP", 50),
+		MaxTunnelTCPConnsGlobal: envInt("MAX_TUNNEL_TCP_CONNS_GLOBAL", 1000),
 	}
 
 	// Parse blocked target networks.
@@ -87,14 +90,19 @@ func LoadConfig() (*Config, error) {
 // Note: SafeDial also checks resolved IPs, preventing DNS rebinding.
 // This pre-check provides fast rejection before attempting a TCP connection.
 func (c *Config) IsTargetBlocked(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return true
+	}
+
 	// First check if it's a raw IP.
 	if ip := net.ParseIP(host); ip != nil {
-		for _, blocked := range c.BlockedNets {
-			if blocked.Contains(ip) {
-				return true
-			}
-		}
-		return false
+		return c.isBlockedIP(ip)
+	}
+
+	// Reject invalid hostnames up front.
+	if !isValidHostname(host) {
+		return true
 	}
 
 	// DNS lookup with timeout.
@@ -106,10 +114,8 @@ func (c *Config) IsTargetBlocked(host string) bool {
 	}
 
 	for _, addr := range ips {
-		for _, blocked := range c.BlockedNets {
-			if blocked.Contains(addr.IP) {
-				return true
-			}
+		if c.isBlockedIP(addr.IP) {
+			return true
 		}
 	}
 	return false
@@ -130,10 +136,8 @@ func (c *Config) SafeDial(ctx context.Context, network, addr string) (net.Conn, 
 			if ip == nil {
 				return fmt.Errorf("resolved address %q is not an IP", host)
 			}
-			for _, blocked := range c.BlockedNets {
-				if blocked.Contains(ip) {
-					return fmt.Errorf("resolved IP %s is in blocked range %s", ip, blocked)
-				}
+			if c.isBlockedIP(ip) {
+				return fmt.Errorf("resolved IP %s is blocked", ip)
 			}
 			return nil
 		},
@@ -183,4 +187,70 @@ func envList(key string, fallback []string) []string {
 		return result
 	}
 	return fallback
+}
+
+func (c *Config) isBlockedIP(ip net.IP) bool {
+	ip = normalizeIP(ip)
+	if ip == nil {
+		return true
+	}
+
+	// Preserve existing behavior for explicit allow-all configs
+	// (used by tests and opt-out deployments).
+	if len(c.BlockedNets) == 0 {
+		return false
+	}
+
+	// Defense in depth: deny non-public targets even if BLOCKED_TARGETS is misconfigured.
+	if ip.IsUnspecified() ||
+		ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() {
+		return true
+	}
+
+	for _, blocked := range c.BlockedNets {
+		if blocked.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	return ip
+}
+
+func isValidHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	if strings.ContainsAny(host, " \t\r\n/\\") {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

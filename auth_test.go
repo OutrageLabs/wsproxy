@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -96,6 +97,39 @@ func TestExtractIP(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("extractIP(%q, xff=%q, xri=%q): got %q, want %q",
 				tt.remoteAddr, tt.xff, tt.xRealIP, got, tt.expected)
+		}
+	}
+}
+
+func TestAuth_InvalidJWKSURLFailsClosed(t *testing.T) {
+	auth := NewAuth("http://example.com/jwks.json")
+	req := httptest.NewRequest("GET", "/relay?token=a.b.c", nil)
+	_, err := auth.Authenticate(req)
+	if err == nil {
+		t.Fatal("expected auth failure for insecure JWKS URL")
+	}
+	if !strings.Contains(err.Error(), "JWKS URL must use https") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateJWKSURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "https allowed", url: "https://clerk.example.com/.well-known/jwks.json", wantErr: false},
+		{name: "local http allowed", url: "http://localhost:8080/jwks.json", wantErr: false},
+		{name: "non local http rejected", url: "http://example.com/jwks.json", wantErr: true},
+		{name: "bad scheme rejected", url: "ftp://example.com/jwks", wantErr: true},
+		{name: "empty host rejected", url: "https:///jwks", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		err := validateJWKSURL(tt.url)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("%s: validateJWKSURL(%q) err=%v wantErr=%v", tt.name, tt.url, err, tt.wantErr)
 		}
 	}
 }

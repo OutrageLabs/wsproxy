@@ -5,32 +5,41 @@ import (
 	"time"
 )
 
+const (
+	defaultMaxTrackedIPs   = 10000
+	defaultMaxTrackedUsers = 10000
+)
+
 // RateLimiter enforces per-IP and per-user connection limits.
 // It tracks active connections (not requests/sec) — a connection
 // occupies a slot until it's released.
 type RateLimiter struct {
-	maxPerIP   int
-	maxPerUser int
+	maxPerIP        int
+	maxPerUser      int
+	maxTrackedIPs   int
+	maxTrackedUsers int
 
-	mu      sync.Mutex
-	byIP    map[string]int
-	byUser  map[string]int
-	stopCh  chan struct{}
+	mu     sync.Mutex
+	byIP   map[string]int
+	byUser map[string]int
+	stopCh chan struct{}
 }
 
 // NewRateLimiter creates a rate limiter with the specified connection caps.
 func NewRateLimiter(maxPerIP, maxPerUser int) *RateLimiter {
 	rl := &RateLimiter{
-		maxPerIP:   maxPerIP,
-		maxPerUser: maxPerUser,
-		byIP:       make(map[string]int),
-		byUser:     make(map[string]int),
-		stopCh:     make(chan struct{}),
+		maxPerIP:        maxPerIP,
+		maxPerUser:      maxPerUser,
+		maxTrackedIPs:   maxInt(defaultMaxTrackedIPs, maxPerIP*200),
+		maxTrackedUsers: maxInt(defaultMaxTrackedUsers, maxPerUser*200),
+		byIP:            make(map[string]int),
+		byUser:          make(map[string]int),
+		stopCh:          make(chan struct{}),
 	}
 
 	// Periodic cleanup of zero-count entries to prevent unbounded map growth.
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
@@ -60,6 +69,15 @@ func (rl *RateLimiter) Stop() {
 func (rl *RateLimiter) Acquire(ip, userID string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	if _, ok := rl.byIP[ip]; !ok && len(rl.byIP) >= rl.maxTrackedIPs {
+		return false
+	}
+	if userID != "" {
+		if _, ok := rl.byUser[userID]; !ok && len(rl.byUser) >= rl.maxTrackedUsers {
+			return false
+		}
+	}
 
 	if rl.byIP[ip] >= rl.maxPerIP {
 		return false
@@ -104,4 +122,11 @@ func (rl *RateLimiter) cleanup() {
 			delete(rl.byUser, k)
 		}
 	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

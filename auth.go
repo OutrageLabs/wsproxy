@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,27 +28,36 @@ var (
 	errTokenExpired  = errors.New("auth: token expired")
 	errNoMatchingKey = errors.New("auth: no matching JWK for kid")
 	errAuthDisabled  = errors.New("auth: JWKS URL not configured")
+	errInvalidSub    = errors.New("auth: missing subject claim")
 )
 
 // Auth handles JWT validation using Clerk's JWKS endpoint.
 type Auth struct {
-	jwksURL   string
-	issuer    string // Expected iss claim (empty = skip)
-	audience  string // Expected aud claim (empty = skip)
-	mu        sync.RWMutex
-	keys      map[string]*rsa.PublicKey // kid → public key
-	fetchedAt time.Time
-	cacheTTL  time.Duration
-	sfGroup   singleflight.Group
+	jwksURL     string
+	issuer      string // Expected iss claim (empty = skip)
+	audience    string // Expected aud claim (empty = skip)
+	configErr   error
+	mu          sync.RWMutex
+	keys        map[string]*rsa.PublicKey // kid → public key
+	fetchedAt   time.Time
+	cacheTTL    time.Duration
+	maxStaleTTL time.Duration
+	sfGroup     singleflight.Group
 }
 
 // NewAuth creates a new JWT authenticator. If jwksURL is empty, auth is disabled
 // (all requests pass — useful for development).
 func NewAuth(jwksURL string, opts ...AuthOption) *Auth {
 	a := &Auth{
-		jwksURL:  jwksURL,
-		keys:     make(map[string]*rsa.PublicKey),
-		cacheTTL: 15 * time.Minute,
+		jwksURL:     jwksURL,
+		keys:        make(map[string]*rsa.PublicKey),
+		cacheTTL:    15 * time.Minute,
+		maxStaleTTL: 24 * time.Hour,
+	}
+	if jwksURL != "" {
+		if err := validateJWKSURL(jwksURL); err != nil {
+			a.configErr = err
+		}
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -109,6 +120,9 @@ func (a *Auth) Authenticate(r *http.Request) (string, error) {
 	if a.jwksURL == "" {
 		return "anonymous", nil // Auth disabled for dev.
 	}
+	if a.configErr != nil {
+		return "", a.configErr
+	}
 
 	token := r.URL.Query().Get("token")
 	if token == "" {
@@ -153,6 +167,9 @@ func (a *Auth) validateJWT(token string) (*Claims, error) {
 	if header.Alg != "RS256" {
 		return nil, fmt.Errorf("auth: unsupported algorithm %q", header.Alg)
 	}
+	if header.Kid == "" {
+		return nil, fmt.Errorf("auth: missing kid")
+	}
 
 	// Get the public key for this kid.
 	pubKey, err := a.getKey(header.Kid)
@@ -177,6 +194,9 @@ func (a *Auth) validateJWT(token string) (*Claims, error) {
 	}
 
 	now := time.Now().Unix()
+	if claims.Sub == "" {
+		return nil, errInvalidSub
+	}
 	if now > claims.Exp {
 		return nil, errTokenExpired
 	}
@@ -221,9 +241,12 @@ func (a *Auth) getKey(kid string) (*rsa.PublicKey, error) {
 		return nil, a.fetchJWKS()
 	})
 	if sfErr != nil {
-		// If we have a cached key, use it even if stale.
+		// If we have a cached key, allow a bounded stale fallback.
 		if ok {
-			return key, nil
+			staleAge := time.Since(a.fetchedAt)
+			if staleAge <= a.maxStaleTTL {
+				return key, nil
+			}
 		}
 		return nil, fmt.Errorf("auth: fetch JWKS: %w", sfErr)
 	}
@@ -254,7 +277,16 @@ type jwkKey struct {
 
 // fetchJWKS downloads and caches the JWKS keys from the Clerk endpoint.
 func (a *Auth) fetchJWKS() error {
-	client := &http.Client{Timeout: 10 * time.Second}
+	if err := validateJWKSURL(a.jwksURL); err != nil {
+		return err
+	}
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get(a.jwksURL)
 	if err != nil {
 		return err
@@ -263,6 +295,9 @@ func (a *Auth) fetchJWKS() error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("JWKS endpoint returned %d", resp.StatusCode)
+	}
+	if resp.ContentLength > 1<<20 {
+		return fmt.Errorf("JWKS response too large: %d", resp.ContentLength)
 	}
 
 	// Limit JWKS response to 1 MB to prevent OOM from malicious/misconfigured endpoints.
@@ -293,6 +328,9 @@ func (a *Auth) fetchJWKS() error {
 
 // jwkToRSAPublicKey converts a JWK to an RSA public key.
 func jwkToRSAPublicKey(k jwkKey) (*rsa.PublicKey, error) {
+	if k.Alg != "" && k.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported JWK alg %q", k.Alg)
+	}
 	nBytes, err := base64URLDecode(k.N)
 	if err != nil {
 		return nil, fmt.Errorf("decode n: %w", err)
@@ -304,11 +342,50 @@ func jwkToRSAPublicKey(k jwkKey) (*rsa.PublicKey, error) {
 
 	n := new(big.Int).SetBytes(nBytes)
 	e := new(big.Int).SetBytes(eBytes)
+	if n.BitLen() < 2048 {
+		return nil, fmt.Errorf("RSA modulus too small: %d bits", n.BitLen())
+	}
+	if e.Sign() <= 0 {
+		return nil, fmt.Errorf("invalid exponent")
+	}
+	if e.BitLen() > 31 {
+		return nil, fmt.Errorf("exponent too large")
+	}
+	eVal := int(e.Int64())
+	if eVal < 3 || eVal%2 == 0 {
+		return nil, fmt.Errorf("invalid exponent value")
+	}
 
 	return &rsa.PublicKey{
 		N: n,
-		E: int(e.Int64()),
+		E: eVal,
 	}, nil
+}
+
+// validateJWKSURL enforces safe URL shape for remote key retrieval.
+func validateJWKSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("auth: invalid JWKS URL: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("auth: invalid JWKS URL %q", raw)
+	}
+	if u.Scheme != "https" {
+		// Allow local http for development/testing only.
+		if !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+			return fmt.Errorf("auth: JWKS URL must use https (or local http): %q", raw)
+		}
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // verifyRS256 verifies an RS256 JWT signature.

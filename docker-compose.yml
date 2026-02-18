@@ -13,6 +13,8 @@ services:
       TUNNEL_PORT_MAX: "10100"
       MAX_CONNS_PER_IP: "10"
       MAX_CONNS_PER_USER: "20"
+      MAX_TUNNEL_HTTP_PER_IP: "50"
+      MAX_TUNNEL_TCP_CONNS_GLOBAL: "1000"
     restart: unless-stopped
 
   # Example: Caddy reverse proxy for TLS termination + wildcard subdomain routing

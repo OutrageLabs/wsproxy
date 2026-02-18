@@ -42,7 +42,9 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			slog.Warn("health write failed", "err", err)
+		}
 	})
 
 	// WebSocket relay — bidirectional WS↔TCP for SSH.
@@ -94,7 +96,9 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	server.Shutdown(shutdownCtx)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("server shutdown error", "err", err)
+	}
 	rl.Stop()
 	tunnelHTTPRL.Stop()
 
@@ -103,9 +107,10 @@ func main() {
 
 // isTunnelSubdomain checks if the host is a subdomain of the tunnel domain.
 func isTunnelSubdomain(host, tunnelDomain string) bool {
-	// Strip port.
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
+	host = canonicalHost(host)
+	tunnelDomain = canonicalHost(tunnelDomain)
+	if host == "" || tunnelDomain == "" || host == tunnelDomain {
+		return false
 	}
 	return strings.HasSuffix(host, "."+tunnelDomain) && host != tunnelDomain
 }

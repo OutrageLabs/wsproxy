@@ -62,3 +62,25 @@ func TestRateLimiter_NoUser(t *testing.T) {
 		t.Error("third acquire should fail (IP limit)")
 	}
 }
+
+func TestRateLimiter_TrackedKeyCaps(t *testing.T) {
+	rl := NewRateLimiter(1, 1)
+	rl.maxTrackedIPs = 2
+	rl.maxTrackedUsers = 2
+
+	if !rl.Acquire("1.1.1.1", "u1") {
+		t.Fatal("first unique key should succeed")
+	}
+	if !rl.Acquire("2.2.2.2", "u2") {
+		t.Fatal("second unique key should succeed")
+	}
+	if rl.Acquire("3.3.3.3", "u3") {
+		t.Fatal("third unique key should fail due tracked-key cap")
+	}
+
+	rl.Release("1.1.1.1", "u1")
+	rl.cleanup()
+	if !rl.Acquire("3.3.3.3", "u3") {
+		t.Fatal("new key should succeed after cleanup frees capacity")
+	}
+}
