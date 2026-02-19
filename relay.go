@@ -143,9 +143,11 @@ func HandleRelay(cfg *Config, auth *Auth, rl *RateLimiter) http.HandlerFunc {
 		}()
 
 		// Wait for first direction to finish, then cancel the other.
-		<-errc
+		firstErr := <-errc
+		slog.Info("relay first close", "err", firstErr)
 		cancel()
-		<-errc // Wait for the second to finish too.
+		secondErr := <-errc // Wait for the second to finish too.
+		slog.Info("relay second close", "err", secondErr)
 
 		slog.Info("relay ended")
 		if closeErr := wsConn.Close(websocket.StatusNormalClosure, "relay ended"); closeErr != nil {
